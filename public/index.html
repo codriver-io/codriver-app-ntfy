@@ -264,6 +264,14 @@ var BACKOFF_MS = [2000, 4000, 8000, 15000, 30000, 60000];
 // ntfy caches 12h by default; asking for more just returns what it has.
 var INITIAL_SINCE = "3h";
 
+// A message older than this never becomes a toast — it is backfill, not news.
+// Ten minutes is long enough that a tunnel or a parking garage still surfaces
+// what was missed, and short enough that starting the car is silent.
+var TOAST_MAX_AGE_MS = 10 * 60 * 1000;
+
+// Toasts one burst may produce before the tail collapses into "+N more".
+var TOAST_BURST_MAX = 3;
+
 // ntfy topic charset, from the server's own routing regex
 // (server/server.go: `^/[-_A-Za-z0-9]{1,64}...`). Validating here lets us say
 // "that topic name is not valid" instead of surfacing an opaque 404.
@@ -304,6 +312,10 @@ var state = {
   lastId: null,         // for `since=` on reconnect, so we backfill the gap
   connected: false,
   everConnected: false,
+  // 'slot' (draw the feed) or 'channel' (draw nothing, toast through the host).
+  // Defaults to 'slot' so a host that predates ADR-0045 gets the old behaviour.
+  surface: "slot",
+  pending: [],          // ingested this tick, awaiting flushPending()
   fatal: null           // { title, detail } when we have stopped retrying
 };
 
@@ -364,6 +376,18 @@ function applyContext(ctx) {
   // Accepted and ignored on purpose — a widget must not choke on fields it
   // does not use, because the host will add more of them.
 
+  // `surface` (codriver ADR-0045) decides what this app IS.
+  //
+  //   'slot'    — we have a rectangle. Draw the feed, as we always have.
+  //   'channel' — nobody can see us. Draw nothing and hand each new message to
+  //               the host as a `notify`, which it draws as a toast.
+  //
+  // A channel is the right home for this app and the one the marketplace
+  // listing asks for: a notifier has nothing to show for hours and then wants
+  // four seconds of attention. Absent field ⇒ 'slot', so an older host that
+  // predates the split still gets the panel it expects.
+  state.surface = ctx.surface === "channel" ? "channel" : "slot";
+
   // --- config: only re-subscribe if it actually changed --------------------
   var cfg = normalizeConfig(ctx.config);
   var changed = !state.cfg ||
@@ -385,6 +409,67 @@ function applyContext(ctx) {
 // because it carries no data: at this point we have never been told who our
 // parent is, so there is no origin to target. Every other outbound message (if
 // this widget ever gains one) must use state.hostOrigin.
+/**
+ * Guest → host, the channel half of the SDK. Origin-targeted, never '*':
+ * unlike `ready` this carries content, and by the time we have anything to
+ * send the host has already introduced itself.
+ */
+function postNotify(title, body, priority, tag) {
+  if (!state.hostOrigin) return;
+  try {
+    window.parent.postMessage({
+      codriver: 1,
+      type: "notify",
+      title: title,
+      body: body,
+      priority: priority,
+      tag: tag
+    }, state.hostOrigin);
+  } catch (e) {
+    // Host gone or navigated. Nothing to retry — the next message will try again.
+  }
+}
+
+/**
+ * Emit the toasts a burst of ingested messages earned.
+ *
+ * Two rules, both about not being a nuisance on a windscreen:
+ *
+ *  • Nothing OLD toasts. Our first connect backfills three hours (streamUrl's
+ *    INITIAL_SINCE) so the panel has content — firing twenty toasts at the
+ *    driver because they started the car is the exact failure this feature
+ *    would be remembered for. TOAST_MAX_AGE_MS is the line, and it is generous
+ *    enough that messages missed in a tunnel still arrive as toasts on
+ *    reconnect, which is the case that matters.
+ *
+ *  • A burst COLLAPSES. Three at once is a stack; ten at once is a wall. Past
+ *    the cap the rest become one "+N more" line, which is all a driver can
+ *    act on anyway.
+ */
+function flushPending() {
+  var due = state.pending;
+  state.pending = [];
+  if (!due.length || state.surface !== "channel") return;
+
+  due.sort(function (a, b) { return b.time - a.time; });   // newest first
+  var shown = due.length <= TOAST_BURST_MAX ? due : due.slice(0, TOAST_BURST_MAX - 1);
+  for (var i = shown.length - 1; i >= 0; i--) {            // oldest of the shown first
+    var m = shown[i];
+    postNotify(
+      m.title || state.cfg.topic,
+      m.message,
+      m.priority,
+      // Tagged by ntfy id: the host replaces rather than stacks if the same
+      // message somehow arrives twice, and distinct messages never collide.
+      "ntfy:" + m.id
+    );
+  }
+  var hidden = due.length - shown.length;
+  if (hidden > 0) {
+    postNotify(state.cfg.topic, "+" + hidden + " more notifications", 3, "ntfy:burst");
+  }
+}
+
 function postReady() {
   try {
     window.parent.postMessage({ codriver: 1, type: "ready" }, "*");
@@ -694,6 +779,19 @@ function ingest(msg) {
   // `since=` on the next reconnect wants the newest id we have.
   state.lastId = state.messages[0].id;
 
+  // Queue it for a toast if it is actually news. `state.messages[0]` is not
+  // necessarily this message (the sort above may have placed an older backfill
+  // entry differently), so read back the normalised copy by id.
+  if (state.surface === "channel") {
+    var fresh = null;
+    for (var k = 0; k < state.messages.length; k++) {
+      if (state.messages[k].id === msg.id) { fresh = state.messages[k]; break; }
+    }
+    if (fresh && Date.now() - fresh.time * 1000 <= TOAST_MAX_AGE_MS) {
+      state.pending.push(fresh);
+    }
+  }
+
   // Coalesced on purpose. A reconnect replays every cached message in one
   // burst, and re-rendering (plus re-serialising to localStorage) once per
   // message would be a hundred layouts on a GPU that is already busy drawing a
@@ -820,11 +918,22 @@ function scheduleRender() {
     state.renderTimer = 0;
     pruneSeen();
     saveCache();
+    // On a channel the DOM is never seen, so laying it out is pure waste on a
+    // GPU already drawing a 3D map. The store is still maintained above —
+    // `lastId`, the de-dup set and the cache all matter either way.
+    flushPending();
     render();
   }, 60);
 }
 
 function render() {
+  // On a channel nobody can see this document, so laying it out is pure waste
+  // on a GPU already drawing a 3D map. Guarded here rather than at each call
+  // site so no future caller can reintroduce the cost by accident. Everything
+  // that matters off-screen — the store, `lastId`, the de-dup set, the cache —
+  // is maintained before this point.
+  if (state.surface === "channel") return;
+
   // --- status strip: only when there is something to say -------------------
   if (state.fatal) {
     setStatus(null);
