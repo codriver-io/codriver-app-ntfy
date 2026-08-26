@@ -1,0 +1,13 @@
+{
+  "name": "codriver-app-ntfy",
+  "private": true,
+  "version": "1.0.0",
+  "description": "ntfy.sh client for the codriver widget slot: phone notifications on the Tesla driving overlay",
+  "scripts": {
+    "serve": "python3 -m http.server 8790 -d public",
+    "deploy": "wrangler pages deploy public --project-name ntfy-client-codriver --branch main --commit-dirty=true"
+  },
+  "devDependencies": {
+    "wrangler": "^4.126.0"
+  }
+}

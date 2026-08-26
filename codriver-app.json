@@ -1,0 +1,40 @@
+{
+  "$comment": "Manifest submitted to the codriver app marketplace. This repo doubles as the worked example: every field below is the real value that ships.",
+  "name": "ntfy",
+  "description": "Shows your phone's ntfy.sh notifications beside the map, newest first. Works with ntfy.sh or your own self-hosted server, and with protected topics.",
+  "install_instructions": "Install ntfy on your phone (ntfy.sh) and pick a topic name that nobody could guess. In codriver.io/account -> Apps -> ntfy, enter the server (https://ntfy.sh unless you self-host) and that topic name. If the topic is protected, paste an access token from your ntfy account. Anything you publish to the topic appears in the widget within a second.",
+  "integration_types": ["widget", "notifications"],
+  "widget_url": "https://ntfy-client-codriver.pages.dev",
+  "website_url": "https://github.com/codriver-io/codriver-app-ntfy",
+  "docs_url": "https://github.com/codriver-io/codriver-app-ntfy#readme",
+  "cost_model": "free",
+  "version": "1.0.0",
+  "config_schema": {
+    "fields": [
+      {
+        "key": "server",
+        "label": "ntfy server",
+        "type": "url",
+        "required": true,
+        "default": "https://ntfy.sh",
+        "help": "Use your own server's URL if you self-host."
+      },
+      {
+        "key": "topic",
+        "label": "Topic",
+        "type": "string",
+        "required": true,
+        "maxLength": 64,
+        "help": "The topic you publish to from your phone."
+      },
+      {
+        "key": "token",
+        "label": "Access token",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "help": "Only needed for protected topics."
+      }
+    ]
+  }
+}

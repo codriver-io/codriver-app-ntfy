@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ntfy for codriver — dev harness</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Deliberately plain. This page never ships to a car — it exists so the
+     widget can be developed and demoed without running codriver at all. */
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 24px;
+    background: #16181d; color: #e9ecef;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+  p.sub { margin: 0 0 16px; color: #9aa2ad; font-size: 12px; max-width: 46ch; }
+  fieldset { border: 1px solid #2b2f36; border-radius: 6px; padding: 12px 14px; margin: 0 0 12px; }
+  legend { color: #9aa2ad; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding: 0 4px; }
+  label { display: block; margin: 8px 0 2px; font-size: 11px; color: #9aa2ad; }
+  input, select { width: 100%; background: #0c0e11; color: #e9ecef; border: 1px solid #333840;
+                  border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 13px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  button { background: #2f6df6; color: #fff; border: 0; border-radius: 4px;
+           padding: 8px 12px; font: inherit; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  button.secondary { background: #333840; }
+  /* The slot. Matches the real widget slot: ~300x130 CSS px. Resizable so you
+     can prove the layout holds when the host hands you a different box. */
+  #slot-wrap { display: flex; flex-direction: column; gap: 8px; }
+  #slot {
+    width: 300px; height: 130px;
+    border: 1px solid #333840; border-radius: 8px; overflow: hidden;
+    resize: both;
+  }
+  iframe { width: 100%; height: 100%; border: 0; display: block; }
+  code { background: #0c0e11; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .hint { color: #6b7480; font-size: 11px; margin-top: 8px; max-width: 40ch; }
+</style>
+</head>
+<body>
+
+<div>
+  <h1>ntfy for codriver — dev harness</h1>
+  <p class="sub">
+    Fakes the codriver host: posts the same <code>context</code> message the driver
+    app sends, into the same sandboxed iframe. Settings are remembered in this
+    page's localStorage, not the widget's.
+  </p>
+
+  <fieldset>
+    <legend>config (sent inside context.config)</legend>
+    <label for="server">server</label>
+    <input id="server" value="https://ntfy.sh">
+    <label for="topic">topic</label>
+    <input id="topic" placeholder="pick something unguessable">
+    <label for="token">token (optional)</label>
+    <input id="token" type="password" placeholder="tk_…">
+  </fieldset>
+
+  <fieldset>
+    <legend>context (host chrome)</legend>
+    <div class="row">
+      <div>
+        <label for="theme">theme</label>
+        <select id="theme"><option>dark</option><option>light</option></select>
+      </div>
+      <div>
+        <label for="units">units</label>
+        <select id="units"><option>metric</option><option>imperial</option></select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="uiSize">uiSize (1–10, default 6)</label>
+        <input id="uiSize" type="number" min="1" max="10" value="6">
+      </div>
+      <div>
+        <label for="device">device</label>
+        <select id="device"><option>tesla</option><option>other</option></select>
+      </div>
+    </div>
+  </fieldset>
+
+  <button id="send">Send context</button>
+  <button id="reload" class="secondary">Reload widget</button>
+  <button id="publish" class="secondary">Publish a test message</button>
+  <p class="hint">
+    “Publish a test message” POSTs to the topic from this page, so you can watch
+    a real message arrive over the real SSE stream. Equivalent to
+    <code>curl -d "test" ntfy.sh/&lt;topic&gt;</code>.
+  </p>
+</div>
+
+<div id="slot-wrap">
+  <div id="slot">
+    <!-- The same sandbox the host uses. If the widget ever needs a capability
+         that is not in this list, that is a change to the host contract, not
+         something to paper over here. -->
+    <iframe id="frame" src="./index.html"
+            sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
+  </div>
+  <div class="hint">Drag the bottom-right corner to resize the slot.</div>
+</div>
+
+<script>
+"use strict";
+
+var $ = function (id) { return document.getElementById(id); };
+var FIELDS = ["server", "topic", "token", "theme", "units", "uiSize", "device"];
+var STORE = "ntfy-codriver-dev";
+
+// --- remember the last setup so a reload does not mean retyping a topic -----
+try {
+  var saved = JSON.parse(localStorage.getItem(STORE) || "{}");
+  FIELDS.forEach(function (f) { if (saved[f] != null) $(f).value = saved[f]; });
+} catch (e) {}
+if (!$("topic").value) {
+  // A random topic by default: ntfy topics are public unless protected, so a
+  // guessable name means strangers can read (and publish to) your test feed.
+  $("topic").value = "cd-dev-" + Math.random().toString(36).slice(2, 12);
+}
+
+function save() {
+  var o = {};
+  FIELDS.forEach(function (f) { o[f] = $(f).value; });
+  try { localStorage.setItem(STORE, JSON.stringify(o)); } catch (e) {}
+}
+
+function context() {
+  var slot = $("slot");
+  return {
+    codriver: 1,
+    type: "context",
+    theme: $("theme").value,
+    units: $("units").value,
+    uiSize: Number($("uiSize").value) || 6,
+    slot: 1,
+    size: { w: slot.clientWidth, h: slot.clientHeight },
+    device: $("device").value,
+    config: {
+      server: $("server").value.trim(),
+      topic: $("topic").value.trim(),
+      token: $("token").value.trim() || undefined
+    }
+  };
+}
+
+function send() {
+  save();
+  // The real host targets the widget's exact origin, never '*'. Locally the
+  // widget is same-origin with this page, so location.origin is correct here
+  // and the shape of the call is the shape the host uses.
+  $("frame").contentWindow.postMessage(context(), location.origin);
+}
+
+// The host sends context on iframe load, again when the widget posts `ready`,
+// and on any theme/units/uiSize change. Reproduce all three so the widget's
+// "handle it more than once" path is exercised every single run.
+$("frame").addEventListener("load", send);
+window.addEventListener("message", function (e) {
+  if (e.source !== $("frame").contentWindow) return;
+  if (!e.data || e.data.codriver !== 1 || e.data.type !== "ready") return;
+  send();
+});
+["theme", "units", "uiSize"].forEach(function (f) {
+  $(f).addEventListener("change", send);
+});
+
+// The real host also re-sends context when the slot's rendered size changes.
+// Mirror that here so dragging the resize handle exercises the same path.
+if (typeof ResizeObserver === "function") {
+  var rt = 0;
+  new ResizeObserver(function () {
+    clearTimeout(rt);
+    rt = setTimeout(send, 120);
+  }).observe($("slot"));
+}
+
+$("send").addEventListener("click", send);
+$("reload").addEventListener("click", function () {
+  save();
+  $("frame").contentWindow.location.reload();
+});
+
+$("publish").addEventListener("click", function () {
+  save();
+  var c = context().config;
+  var headers = { Title: "Dev test", Priority: "4", Tags: "warning,computer" };
+  if (c.token) headers.Authorization = "Bearer " + c.token;
+  fetch(c.server.replace(/\/+$/, "") + "/" + encodeURIComponent(c.topic), {
+    method: "POST",
+    headers: headers,
+    body: "Published at " + new Date().toLocaleTimeString()
+  }).then(function (r) {
+    if (!r.ok) alert("publish failed: HTTP " + r.status);
+  }).catch(function (err) { alert("publish failed: " + err); });
+});
+</script>
+</body>
+</html>

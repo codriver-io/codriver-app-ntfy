@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<!-- The host sizes the iframe; we always fill it. No user zoom: this is a HUD panel, not a page. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Nothing about the driver's setup should leak outbound. We only ever talk to their ntfy server. -->
+<meta name="referrer" content="no-referrer">
+<!-- Static, deliberately generic: the topic must never end up in document.title (see SECURITY notes). -->
+<title>ntfy for codriver</title>
+<style>
+/* ============================================================================
+   THEME TOKENS
+   Two themes, both authored on purpose. The host tells us which one via the
+   `context` message; we only flip a `data-theme` attribute, so a theme change
+   costs a style recalc and never a re-render or a refetch.
+
+   Colours are picked for a sunlit windscreen, not a desk: the dark theme is
+   near-black with a high-contrast foreground (the car's own night UI does the
+   same), and the light theme is a warm grey rather than white so it does not
+   flare at night. Nothing here animates, pulses or flashes — the driver is
+   driving, and motion in the periphery steals attention that the road needs.
+   ========================================================================= */
+:root {
+  --bg:            #0c0e11;
+  --bg-elev:       #14171c;
+  --fg:            #e9ecef;
+  --fg-muted:      #9aa2ad;
+  --fg-faint:      #6b7480;
+  --rule:          rgba(255,255,255,.09);
+  --accent-high:   #f0a63c;  /* ntfy priority 4 */
+  --accent-max:    #ff6a52;  /* ntfy priority 5 */
+  --accent-ok:     #5cc98a;
+  --accent-warn:   #f0a63c;
+  --accent-err:    #ff6a52;
+  /* Root type scale. Recomputed from the host's uiSize (1..10) in setUiSize(). */
+  --fs: 13.5px;
+}
+:root[data-theme="light"] {
+  --bg:            #f2f3f5;
+  --bg-elev:       #ffffff;
+  --fg:            #14171c;
+  --fg-muted:      #5b6470;
+  --fg-faint:      #8b939e;
+  --rule:          rgba(0,0,0,.10);
+  --accent-high:   #b06a00;
+  --accent-max:    #c2381f;
+  --accent-ok:     #1e7d47;
+  --accent-warn:   #b06a00;
+  --accent-err:    #c2381f;
+}
+
+/* ============================================================================
+   LAYOUT
+   The slot is ~300x130 CSS px. Everything below is sized off `--fs` so that a
+   uiSize change rescales the whole panel coherently instead of just bumping
+   one font. `overflow: hidden` everywhere is load-bearing: we trim the list to
+   fit in JS (see trimToFit) and never want a scrollbar the driver would have
+   to touch.
+   ========================================================================= */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  /* System stack only. A webfont is an extra request and a layout shift on a
+     connection that may be a phone tether in a tunnel. */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: var(--fs);
+  line-height: 1.25;
+  -webkit-font-smoothing: antialiased;
+  /* Tesla's browser is a touchscreen in a moving car: kill the tap highlight
+     and any accidental text selection from a bump in the road. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0.45em 0.6em;
+  gap: 0.35em;
+}
+
+/* --- status strip -------------------------------------------------------
+   Hidden entirely while everything is fine. Chrome that says "all good" is
+   chrome that costs pixels in a 130px-tall box for no information. */
+#status {
+  display: none;
+  align-items: center;
+  gap: 0.45em;
+  flex: none;
+  font-size: 0.82em;
+  color: var(--fg-muted);
+  letter-spacing: .01em;
+}
+#status[data-show="1"] { display: flex; }
+#dot {
+  width: 0.5em; height: 0.5em; border-radius: 50%;
+  background: var(--fg-faint);
+  flex: none;
+}
+#status[data-level="warn"] #dot { background: var(--accent-warn); }
+#status[data-level="err"]  #dot { background: var(--accent-err); }
+#status[data-level="ok"]   #dot { background: var(--accent-ok); }
+#status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- message list ------------------------------------------------------- */
+#list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.item {
+  flex: none;
+  padding: 0.3em 0 0.3em 0.5em;
+  border-left: 2px solid transparent;
+}
+.item + .item { border-top: 1px solid var(--rule); }
+/* Priority is shown as a quiet left rule, never as a colour wash or a badge:
+   at a glance you want to know "is this the urgent one" from shape, not read a
+   label. 1 (min) and 2 (low) simply recede. */
+.item[data-prio="4"] { border-left-color: var(--accent-high); }
+.item[data-prio="5"] { border-left-color: var(--accent-max); }
+.item[data-prio="1"], .item[data-prio="2"] { opacity: .62; }
+
+.row { display: flex; align-items: baseline; gap: 0.5em; }
+.headline {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.age {
+  flex: none;
+  font-size: 0.78em;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+.body {
+  margin-top: 0.1em;
+  color: var(--fg-muted);
+  font-size: 0.92em;
+  /* Two lines max on the newest item; the rest is a tap away on the phone. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The newest message is the one the driver is glancing for, so it is the only
+   one that gets weight, full brightness and a body. Older ones are one dim
+   line each — present for context, not for reading. */
+.item.featured .headline { font-weight: 600; font-size: 1.06em; }
+.item:not(.featured) .headline { color: var(--fg-muted); font-size: 0.94em; }
+.item:not(.featured) .body { display: none; }
+
+.tags {
+  margin-top: 0.15em;
+  font-size: 0.78em;
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- placeholder (empty / setup / fatal error) --------------------------- */
+#placeholder {
+  display: none;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.25em;
+  overflow: hidden;
+}
+#placeholder[data-show="1"] { display: flex; }
+#ph-title { font-weight: 600; }
+#ph-detail {
+  color: var(--fg-muted);
+  font-size: 0.9em;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+#ph-title[data-level="err"] { color: var(--accent-err); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="status" role="status" aria-live="polite">
+    <span id="dot" aria-hidden="true"></span>
+    <span id="status-text"></span>
+  </div>
+  <div id="placeholder" data-show="1">
+    <div id="ph-title">Waiting for codriver…</div>
+    <div id="ph-detail">This panel receives its settings from the app.</div>
+  </div>
+  <div id="list" aria-label="Notifications"></div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+ * ntfy for codriver — a widget-slot app.
+ *
+ * WHAT THIS IS
+ *   A ~300x130px page that codriver embeds in a sandboxed cross-origin iframe
+ *   next to the map in a Tesla's browser. It subscribes to one ntfy topic and
+ *   shows the newest notifications, newest first.
+ *
+ * WHY IT IS WRITTEN LIKE THIS
+ *   It is also the reference implementation for the codriver widget SDK, so the
+ *   comments explain decisions, not syntax. Three constraints drive nearly all
+ *   of them:
+ *
+ *   1. It shares an eight-year-old GPU with a 3D map that is fighting for
+ *      25 fps. So: no animation loop, no rAF, no polling timer we can do
+ *      without, one 30s tick for relative timestamps and nothing else.
+ *   2. The network is a car's LTE modem in a tunnel. So: a transport that
+ *      reconnects by itself, a watchdog for the half-open connections that
+ *      no transport detects, and backoff that never hammers.
+ *   3. The reader is driving. So: the newest item is the only prominent one,
+ *      nothing moves, nothing flashes, and every failure state says what to
+ *      fix rather than what went wrong.
+ *
+ * SECURITY POSTURE
+ *   - Every inbound postMessage is validated and the host origin is pinned on
+ *     first accept (see onHostMessage).
+ *   - Config (server / topic / token) arrives ONLY in the context message.
+ *     Never from the URL. The topic and token never enter the URL bar,
+ *     document.title, or any console log.
+ *   - Notification content is untrusted text from whatever publishes to the
+ *     topic. It is written with textContent / createElement exclusively —
+ *     there is not one innerHTML in this file, and that is deliberate.
+ * ========================================================================= */
+
+/* ---------------------------------------------------------------------------
+ * 1. CONSTANTS
+ * ------------------------------------------------------------------------ */
+
+// Messages kept in memory. Cheap, and gives the list something to fall back to
+// when the top items are trimmed away at a large uiSize.
+var STORE_MAX = 20;
+// Rendered at most. The box is ~130px tall; trimToFit() usually cuts this to 2-3.
+var RENDER_MAX = 4;
+
+// ntfy's default keepalive-interval is 45s. If we hear nothing at all for this
+// long the connection is half-open: TCP is up as far as the browser is
+// concerned but nothing is flowing. No transport detects this, so we do.
+var WATCHDOG_MS = 120000;
+
+// Reconnect backoff for the fatal path only (see subscribe()). Jittered so a
+// fleet of cars leaving the same tunnel does not arrive in lockstep.
+var BACKOFF_MS = [2000, 4000, 8000, 15000, 30000, 60000];
+
+// How far back to ask for on the very first connect, so the panel has content
+// the moment the driver gets in rather than after the first new notification.
+// ntfy caches 12h by default; asking for more just returns what it has.
+var INITIAL_SINCE = "3h";
+
+// ntfy topic charset, from the server's own routing regex
+// (server/server.go: `^/[-_A-Za-z0-9]{1,64}...`). Validating here lets us say
+// "that topic name is not valid" instead of surfacing an opaque 404.
+var TOPIC_RE = /^[-_A-Za-z0-9]{1,64}$/;
+
+var CACHE_KEY_PREFIX = "ntfy-codriver:v1:";
+
+/* ---------------------------------------------------------------------------
+ * 2. STATE
+ * ------------------------------------------------------------------------ */
+
+var el = {
+  root:       document.documentElement,
+  status:     document.getElementById("status"),
+  statusText: document.getElementById("status-text"),
+  list:       document.getElementById("list"),
+  ph:         document.getElementById("placeholder"),
+  phTitle:    document.getElementById("ph-title"),
+  phDetail:   document.getElementById("ph-detail")
+};
+
+var state = {
+  // Pinned on the first accepted `context` message; every later message must
+  // come from the same origin.
+  hostOrigin: null,
+  // Last applied config, used to decide whether a re-delivered context needs a
+  // re-subscribe (expensive) or only a re-render (free).
+  cfg: null,
+  size: { w: 0, h: 0 },
+  es: null,             // the live EventSource, if any
+  messages: [],         // newest first
+  seen: Object.create(null),
+  attempt: 0,           // consecutive fatal reconnects, indexes BACKOFF_MS
+  softErrors: 0,        // consecutive EventSource self-retries without a success
+  retryTimer: 0,
+  watchdog: 0,
+  renderTimer: 0,
+  lastId: null,         // for `since=` on reconnect, so we backfill the gap
+  connected: false,
+  everConnected: false,
+  fatal: null           // { title, detail } when we have stopped retrying
+};
+
+/* ---------------------------------------------------------------------------
+ * 3. HOST SDK — the codriver widget contract
+ *
+ * The host posts, at our exact origin:
+ *   { codriver: 1, type: 'context', theme, units, uiSize, slot, size, device,
+ *     config: { server, topic, token } }
+ * on iframe load, again whenever we post `ready`, on any theme/units/uiSize
+ * change, AND whenever the slot's rendered size changes. So `context` is a full
+ * state snapshot that can arrive at any time and any number of times — it is
+ * not an init event, and treating it as one is the single easiest way to get
+ * this wrong. A resize would tear down a perfectly good subscription.
+ *
+ * Lifecycle guarantee we rely on: once mounted, this iframe stays loaded. When
+ * the driver opens the nav drawer the host sets `hidden` on the frame rather
+ * than unmounting it, so the stream survives — but Chromium throttles timers in
+ * a hidden frame, so the watchdog and the backoff may fire long after they were
+ * due. That is handled in the visibilitychange handler at the bottom, and it is
+ * why reconnects resume with `since=<lastId>` instead of assuming the
+ * connection was ever unbroken.
+ * ------------------------------------------------------------------------ */
+
+function onHostMessage(event) {
+  var d = event && event.data;
+
+  // Validate before doing anything at all. An iframe receives messages from
+  // any window that can reach it, including other extensions and libraries
+  // that broadcast to '*'. Anything that is not ours is ignored in silence —
+  // no logging, because a noisy log is its own denial of service.
+  if (!d || d.codriver !== 1 || d.type !== "context") return;
+
+  // Origin pinning: the first message that passes validation defines who the
+  // host is, and nobody else gets to talk to us afterwards. We cannot know the
+  // host origin ahead of time (codriver runs on prod, staging and localhost),
+  // so trust-on-first-use is the strongest check available to us.
+  if (state.hostOrigin === null) {
+    state.hostOrigin = event.origin;
+  } else if (event.origin !== state.hostOrigin) {
+    return;
+  }
+
+  applyContext(d);
+}
+
+function applyContext(ctx) {
+  // --- presentation: always cheap, always re-applied -----------------------
+  el.root.setAttribute("data-theme", ctx.theme === "light" ? "light" : "dark");
+  setUiSize(ctx.uiSize);
+  if (ctx.size && typeof ctx.size.w === "number" && typeof ctx.size.h === "number") {
+    // The host is authoritative about the box it gave us. We keep it for
+    // layout decisions; the actual trim still measures, because a slot can be
+    // resized by CSS on the host side without a new context message.
+    state.size = { w: ctx.size.w, h: ctx.size.h };
+  }
+  // `units` is part of the contract but means nothing to a notification feed.
+  // Accepted and ignored on purpose — a widget must not choke on fields it
+  // does not use, because the host will add more of them.
+
+  // --- config: only re-subscribe if it actually changed --------------------
+  var cfg = normalizeConfig(ctx.config);
+  var changed = !state.cfg ||
+    state.cfg.server !== cfg.server ||
+    state.cfg.topic  !== cfg.topic  ||
+    state.cfg.token  !== cfg.token;
+
+  if (changed) {
+    state.cfg = cfg;
+    resubscribe();
+  } else {
+    render();
+  }
+}
+
+// Post `ready` to tell the host we are alive and want a context snapshot.
+//
+// This is the ONE message we send with targetOrigin '*', and it is safe only
+// because it carries no data: at this point we have never been told who our
+// parent is, so there is no origin to target. Every other outbound message (if
+// this widget ever gains one) must use state.hostOrigin.
+function postReady() {
+  try {
+    window.parent.postMessage({ codriver: 1, type: "ready" }, "*");
+  } catch (e) {
+    // A widget opened directly (not embedded) has itself as parent. Harmless.
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. CONFIG NORMALIZATION
+ * ------------------------------------------------------------------------ */
+
+function normalizeConfig(c) {
+  c = c || {};
+  // Fields the user left blank are OMITTED from `config`, not sent as null, so
+  // a typeof check is the whole story — no null special-casing needed. Note
+  // that a `secret: true` field (the token) still arrives here in full: the
+  // secret flag governs masking in the account form and log redaction on the
+  // host, not delivery to the widget.
+  var server = typeof c.server === "string" ? c.server.trim() : "";
+  var topic  = typeof c.topic  === "string" ? c.topic.trim()  : "";
+  var token  = typeof c.token  === "string" ? c.token.trim()  : "";
+
+  if (!server) server = "https://ntfy.sh";
+  // People type "ntfy.example.com". Accept it rather than failing on a missing
+  // scheme, but never downgrade to http:// on our own initiative.
+  if (!/^https?:\/\//i.test(server)) server = "https://" + server;
+  server = server.replace(/\/+$/, "");
+
+  return { server: server, topic: topic, token: token };
+}
+
+// ntfy accepts credentials either as an `Authorization` header or as an `auth`
+// query parameter holding that same header value, base64url-encoded WITHOUT
+// padding (server/server_auth.go: `base64.RawURLEncoding.DecodeString`).
+//
+// EventSource cannot set request headers — that is the one real cost of
+// choosing it — so a protected topic has to use the query-param form. It is
+// slightly weaker (the value lands in the ntfy server's access log), which is
+// exactly why we (a) only add it when a token is actually configured and
+// (b) never log or display the resulting URL.
+function encodeAuthParam(headerValue) {
+  var bytes = new TextEncoder().encode(headerValue);
+  var bin = "";
+  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. SUBSCRIPTION
+ *
+ * WHY EventSource (/sse) RATHER THAN THE JSON STREAM OR WEBSOCKET
+ *
+ *   ntfy offers /json (newline-delimited JSON over a never-ending response),
+ *   /sse (Server-Sent Events) and /ws (WebSocket). All three carry the same
+ *   message objects, so the choice is purely about failure behaviour in a car.
+ *
+ *   - /json needs `fetch` + a ReadableStream reader, a TextDecoder, a
+ *     line-splitter that survives chunk boundaries, and — the real cost — a
+ *     hand-written reconnect loop. Every one of those is a place to get a
+ *     partial-frame bug that only shows up on a lossy link, which is the exact
+ *     link we have. It is also the path where an old Chromium's streaming
+ *     quirks would bite hardest.
+ *   - /ws reconnects no better than /json (WebSocket has no built-in retry
+ *     either) and adds an upgrade handshake that some in-car / captive-portal
+ *     network paths mangle.
+ *   - /sse is plain HTTP, so it goes through anything that passes HTTP, and
+ *     EventSource retries on its own, in native code, forever, without us
+ *     writing a line. Going in and out of tunnels is the normal case here, not
+ *     the edge case, so the transport that treats "the connection died" as
+ *     routine is the right one.
+ *
+ *   What EventSource does NOT give us, and what the code below adds:
+ *     a) headers — hence the ?auth= form above;
+ *     b) any signal about WHY it failed (no status code, ever) — hence the
+ *        diagnose() probe with fetch, which can read the status;
+ *     c) detection of a half-open connection — hence the keepalive watchdog;
+ *     d) a stop condition — it would retry a 401 until the heat death of the
+ *        universe, so on a fatal auth error we take the wheel and stop.
+ * ------------------------------------------------------------------------ */
+
+function resubscribe() {
+  teardown();
+  state.attempt = 0;
+  state.softErrors = 0;
+  state.everConnected = false;
+  state.fatal = null;
+  state.lastId = null;
+  state.messages = [];
+  state.seen = Object.create(null);
+
+  var cfg = state.cfg;
+  if (!cfg || !cfg.topic) {
+    showPlaceholder("Not set up yet", "Add your ntfy server and topic in codriver.io/account → Apps.", null);
+    return;
+  }
+  if (!TOPIC_RE.test(cfg.topic)) {
+    showPlaceholder("Topic name is not valid",
+      "ntfy topics may only use letters, numbers, - and _ (up to 64 characters). Fix it in codriver.io/account → Apps.", "err");
+    return;
+  }
+
+  // Paint whatever we saw last time immediately, so a reload or a reconnect is
+  // not a blank box. The cache is a convenience, never the source of truth: it
+  // is overwritten by the first live backfill.
+  loadCache();
+  render();
+
+  connect();
+}
+
+function streamUrl() {
+  var cfg = state.cfg;
+  var url = cfg.server + "/" + encodeURIComponent(cfg.topic) + "/sse";
+  var qs = [];
+
+  // On the first connect, backfill a few hours so the panel has content. On a
+  // reconnect, ask for everything after the last message we actually saw, which
+  // closes the gap the outage opened. Duplicates are impossible to rule out
+  // (EventSource's own silent retries reuse this same URL), so the store
+  // de-duplicates by message id and both paths are safe.
+  qs.push("since=" + encodeURIComponent(state.lastId || INITIAL_SINCE));
+
+  if (cfg.token) qs.push("auth=" + encodeAuthParam("Bearer " + cfg.token));
+  return url + "?" + qs.join("&");
+}
+
+function connect() {
+  var es;
+  try {
+    es = new EventSource(streamUrl());
+  } catch (e) {
+    // Malformed server URL. Nothing to retry — the config has to change.
+    showPlaceholder("Server address is not valid",
+      "Check the ntfy server URL in codriver.io/account → Apps.", "err");
+    return;
+  }
+  state.es = es;
+
+  // Native 'open' (the HTTP response arrived) and ntfy's own `event: open`
+  // frame both land here. We do not need to tell them apart: either one proves
+  // the pipe is alive, which is all this handler is for.
+  es.addEventListener("open", function () {
+    state.connected = true;
+    state.everConnected = true;
+    state.attempt = 0;
+    state.softErrors = 0;
+    state.fatal = null;
+    kickWatchdog();
+    render();
+  });
+
+  // ntfy sends `event: keepalive` roughly every 45s. Note that named events do
+  // NOT fire onmessage — the server source says so in as many words — so this
+  // listener is required, and it is the only thing that distinguishes "quiet
+  // topic" from "dead socket".
+  es.addEventListener("keepalive", kickWatchdog);
+
+  // Only real notifications arrive as unnamed `data:` frames. message_delete
+  // and message_clear come through here too, hence the event check below.
+  es.onmessage = function (ev) {
+    kickWatchdog();
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg || msg.event !== "message") return;
+    ingest(msg);
+  };
+
+  es.onerror = function () {
+    kickWatchdog(); // cancel the watchdog; the error path owns the retry now
+
+    // EventSource is already reconnecting on its own — this is the tunnel case,
+    // and the whole reason we picked it. Say so calmly and get out of the way.
+    //
+    // With one limit: the browser's own retry interval is ~3s and it never
+    // widens, which is right for a tunnel and wrong for a self-hosted server
+    // that has been off since Tuesday. After a few failures in a row with no
+    // successful open in between, we take the wheel and switch to our own
+    // backoff, which does widen.
+    if (es.readyState === EventSource.CONNECTING) {
+      state.connected = false;
+      state.softErrors++;
+      if (state.softErrors <= 4) { render(); return; }
+      teardown();
+      render();
+      diagnose();
+      return;
+    }
+
+    // readyState CLOSED means EventSource has given up: a non-2xx response, a
+    // wrong content-type, a dead host. It will not retry, so we must — but
+    // first find out why, because "401" and "the tunnel" need very different
+    // words on screen.
+    teardown();
+    state.connected = false;
+    render();
+    diagnose();
+  };
+}
+
+// EventSource never reports a status code. `fetch` does, and ntfy exposes a
+// purpose-built read-authorization endpoint: GET {server}/{topic}/auth returns
+// 200 when the caller may read the topic, 401/403 when it may not. ntfy sends
+// `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Headers: *`, so
+// the cross-origin preflight this triggers is handled, and here we CAN use a
+// proper Authorization header instead of the query param.
+function diagnose() {
+  var cfg = state.cfg;
+  var headers = cfg.token ? { Authorization: "Bearer " + cfg.token } : undefined;
+
+  fetch(cfg.server + "/" + encodeURIComponent(cfg.topic) + "/auth", {
+    method: "GET",
+    headers: headers,
+    cache: "no-store"
+  }).then(function (res) {
+    if (res.status === 401 || res.status === 403) {
+      // Fatal and actionable: retrying cannot fix a wrong token, and hammering
+      // an auth endpoint from a parked car is how an IP gets rate-limited.
+      // A corrected token arrives as a fresh `context`, which re-subscribes.
+      stopWithFatal(cfg.token ? "Access token rejected" : "This topic needs a token",
+        cfg.token
+          ? "The token is wrong or has no read access to this topic. Update it in codriver.io/account → Apps."
+          : "This topic is protected. Add an access token in codriver.io/account → Apps.");
+    } else if (res.status === 404) {
+      stopWithFatal("Server did not recognise that topic",
+        "Check the server URL and topic in codriver.io/account → Apps.");
+    } else if (res.ok) {
+      // Auth is fine, so the stream failure was transient (a proxy cut it, the
+      // server restarted). Normal retry.
+      scheduleRetry();
+    } else {
+      scheduleRetry();
+    }
+  }).catch(function () {
+    // Could not reach the server at all: no signal, DNS, or the self-hosted box
+    // is down. This is the common case in a car and it is not an error the
+    // driver should act on, so it stays a quiet retry.
+    scheduleRetry();
+  });
+}
+
+function scheduleRetry() {
+  clearTimeout(state.retryTimer);
+  var i = Math.min(state.attempt, BACKOFF_MS.length - 1);
+  state.attempt++;
+  var delay = BACKOFF_MS[i];
+  delay = delay * (0.8 + Math.random() * 0.4); // jitter
+  state.retryTimer = setTimeout(function () {
+    if (state.cfg) connect();
+  }, delay);
+  render();
+}
+
+function stopWithFatal(title, detail) {
+  teardown();
+  state.fatal = { title: title, detail: detail };
+  render();
+}
+
+// The watchdog exists because a half-open TCP connection looks identical to a
+// quiet topic from JavaScript: no error fires, readyState stays OPEN, and the
+// panel silently goes stale for hours. Any inbound frame (open, keepalive,
+// message) rearms it; if none arrives within WATCHDOG_MS we assume the socket
+// is a corpse and force a fresh one.
+function kickWatchdog() {
+  clearTimeout(state.watchdog);
+  state.watchdog = setTimeout(function () {
+    teardown();
+    state.connected = false;
+    render();
+    connect();
+  }, WATCHDOG_MS);
+}
+
+function teardown() {
+  if (state.es) { try { state.es.close(); } catch (e) {} state.es = null; }
+  clearTimeout(state.watchdog);
+  clearTimeout(state.retryTimer);
+  state.watchdog = 0;
+  state.retryTimer = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 6. MESSAGE STORE
+ * ------------------------------------------------------------------------ */
+
+function ingest(msg) {
+  // De-duplicate by ntfy's message id. Required, not defensive: our `since=`
+  // backfill and EventSource's own silent retries both replay messages.
+  if (!msg.id || state.seen[msg.id]) return;
+  state.seen[msg.id] = 1;
+
+  state.messages.unshift({
+    id: msg.id,
+    time: typeof msg.time === "number" ? msg.time : Math.floor(Date.now() / 1000),
+    title: typeof msg.title === "string" ? msg.title : "",
+    message: typeof msg.message === "string" ? msg.message : "",
+    priority: typeof msg.priority === "number" ? msg.priority : 3,
+    tags: Array.isArray(msg.tags) ? msg.tags.filter(function (t) { return typeof t === "string"; }) : []
+  });
+
+  // ntfy replays cached messages oldest-first, so unshifting yields newest-first
+  // for the live case but needs a sort for the backfill burst. Cheap at n<=20.
+  state.messages.sort(function (a, b) { return b.time - a.time; });
+  if (state.messages.length > STORE_MAX) state.messages.length = STORE_MAX;
+
+  // `since=` on the next reconnect wants the newest id we have.
+  state.lastId = state.messages[0].id;
+
+  // Coalesced on purpose. A reconnect replays every cached message in one
+  // burst, and re-rendering (plus re-serialising to localStorage) once per
+  // message would be a hundred layouts on a GPU that is already busy drawing a
+  // 3D map. One frame's worth of delay buys us exactly one of each.
+  scheduleRender();
+}
+
+// Cap the de-dup set. It only ever grows, and a long drive on a chatty topic
+// should not turn it into a slow leak. Rebuilding from the store is exact:
+// anything not in the store can safely be shown again.
+function pruneSeen() {
+  if (Object.keys(state.seen).length < 500) return;
+  state.seen = Object.create(null);
+  for (var i = 0; i < state.messages.length; i++) state.seen[state.messages[i].id] = 1;
+}
+
+/* localStorage is a cache and only a cache.
+ *
+ * We are cross-origin from the host, so this is our own origin's storage, not
+ * codriver's — but it is still storage on a shared car screen, so the ACCESS
+ * TOKEN IS NEVER WRITTEN HERE. Only message text, which the driver has already
+ * seen on this screen. Every access is wrapped: the in-car browser can be in a
+ * private-ish mode where the accessor itself throws.
+ */
+function cacheKey() {
+  return CACHE_KEY_PREFIX + state.cfg.server + "|" + state.cfg.topic;
+}
+function saveCache() {
+  try {
+    localStorage.setItem(cacheKey(), JSON.stringify(state.messages.slice(0, 6)));
+  } catch (e) {}
+}
+function loadCache() {
+  try {
+    var raw = localStorage.getItem(cacheKey());
+    if (!raw) return;
+    var arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+    for (var i = 0; i < arr.length; i++) {
+      var m = arr[i];
+      if (m && m.id && !state.seen[m.id]) { state.seen[m.id] = 1; state.messages.push(m); }
+    }
+    state.messages.sort(function (a, b) { return b.time - a.time; });
+  } catch (e) {}
+}
+
+/* ---------------------------------------------------------------------------
+ * 7. RENDERING
+ *
+ * Everything below builds DOM nodes and assigns textContent. There is no
+ * innerHTML in this file and there must never be one: `title`, `message` and
+ * `tags` are whatever some script on the internet published to the topic, and
+ * this page runs with allow-same-origin in the host's iframe.
+ * ------------------------------------------------------------------------ */
+
+// A deliberately small map of the ntfy tags that actually show up in
+// notifications people send themselves. Anything not in it renders as plain
+// text, which is the correct fallback: the full emoji short-code table is
+// hundreds of kilobytes and this panel has a GPU to share.
+var TAG_EMOJI = {
+  warning: "⚠️", rotating_light: "🚨", "no_entry": "⛔", "no_entry_sign": "🚫",
+  white_check_mark: "✅", heavy_check_mark: "✔️", x: "❌", tada: "🎉",
+  bell: "🔔", loudspeaker: "📢", email: "📧", envelope: "✉️",
+  computer: "💻", floppy_disk: "💾", package: "📦", inbox_tray: "📥",
+  house: "🏠", door: "🚪", key: "🔑", lock: "🔒", unlock: "🔓",
+  car: "🚗", "package:": "📦", battery: "🔋", electric_plug: "🔌",
+  fire: "🔥", droplet: "💧", sunny: "☀️", cloud: "☁️", snowflake: "❄️",
+  triangular_flag_on_post: "🚩", heavy_exclamation_mark: "❗", question: "❓",
+  moneybag: "💰", credit_card: "💳", calendar: "📅", alarm_clock: "⏰",
+  bug: "🐛", wrench: "🔧", gear: "⚙️", robot: "🤖", skull: "💀",
+  green_circle: "🟢", yellow_circle: "🟡", red_circle: "🔴"
+};
+
+function renderTags(tags) {
+  var emoji = [], words = [];
+  for (var i = 0; i < tags.length; i++) {
+    var t = tags[i];
+    if (TAG_EMOJI[t]) emoji.push(TAG_EMOJI[t]);
+    else words.push(t);
+  }
+  return { emoji: emoji.join(" "), words: words.join(" · ") };
+}
+
+// Relative, not absolute: "2 min" is one glance, "14:32" is arithmetic.
+function ago(unixSec) {
+  var s = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+  if (s < 45) return "now";
+  if (s < 3600) return Math.round(s / 60) + " min";
+  if (s < 86400) return Math.round(s / 3600) + " h";
+  return Math.round(s / 86400) + " d";
+}
+
+function setUiSize(uiSize) {
+  // uiSize is a DENSITY PREFERENCE, 1 (compact) .. 10 (largest), default 6 —
+  // not a pixel scale and not a multiplier. So it only biases the root font
+  // size, gently; the actual layout is driven by the box the host gives us
+  // (`size`, and the measurement in trimToFit). Treating it as a scale factor
+  // would make setting 10 unreadable rather than merely roomy.
+  var n = typeof uiSize === "number" && isFinite(uiSize) ? uiSize : 6;
+  n = Math.min(10, Math.max(1, n));
+  document.documentElement.style.setProperty("--fs", (10.5 + n * 0.6).toFixed(2) + "px");
+}
+
+function showPlaceholder(title, detail, level) {
+  el.phTitle.textContent = title;
+  el.phDetail.textContent = detail;
+  if (level) el.phTitle.setAttribute("data-level", level);
+  else el.phTitle.removeAttribute("data-level");
+  el.ph.setAttribute("data-show", "1");
+  el.list.textContent = "";
+}
+
+function setStatus(text, level) {
+  if (!text) { el.status.removeAttribute("data-show"); return; }
+  el.statusText.textContent = text;
+  el.status.setAttribute("data-level", level || "");
+  el.status.setAttribute("data-show", "1");
+}
+
+// Coalesce a burst of ingests into one render + one cache write.
+function scheduleRender() {
+  if (state.renderTimer) return;
+  state.renderTimer = setTimeout(function () {
+    state.renderTimer = 0;
+    pruneSeen();
+    saveCache();
+    render();
+  }, 60);
+}
+
+function render() {
+  // --- status strip: only when there is something to say -------------------
+  if (state.fatal) {
+    setStatus(null);
+  } else if (!state.connected && state.cfg && state.cfg.topic) {
+    // Calm, not alarming: losing the link in a tunnel is expected behaviour,
+    // and a red banner for it would train the driver to ignore banners.
+    setStatus(state.everConnected ? "Reconnecting…" : "Connecting…", "warn");
+  } else {
+    setStatus(null);
+  }
+
+  // --- fatal / empty states ------------------------------------------------
+  if (state.fatal) {
+    showPlaceholder(state.fatal.title, state.fatal.detail, "err");
+    return;
+  }
+  if (!state.cfg || !state.cfg.topic) return; // placeholder already set
+  if (state.messages.length === 0) {
+    showPlaceholder("No notifications yet",
+      "Listening on " + state.cfg.topic + ". Publish to this topic from your phone and it will show up here.", null);
+    return;
+  }
+
+  el.ph.removeAttribute("data-show");
+
+  // --- the list ------------------------------------------------------------
+  var frag = document.createDocumentFragment();
+  var n = Math.min(RENDER_MAX, state.messages.length);
+  for (var i = 0; i < n; i++) frag.appendChild(itemNode(state.messages[i], i === 0));
+
+  el.list.textContent = "";
+  el.list.appendChild(frag);
+  trimToFit();
+}
+
+function itemNode(m, featured) {
+  var item = document.createElement("div");
+  item.className = "item" + (featured ? " featured" : "");
+  item.setAttribute("data-prio", String(m.priority));
+
+  // ntfy defaults an absent title to the topic name; we would rather promote
+  // the message body than repeat the topic on every line, so the headline is
+  // the title when there is one and the message otherwise.
+  var headlineText = m.title || m.message || "(no content)";
+  var bodyText = m.title ? m.message : "";
+
+  var tg = renderTags(m.tags);
+
+  var row = document.createElement("div");
+  row.className = "row";
+
+  var headline = document.createElement("div");
+  headline.className = "headline";
+  headline.textContent = (tg.emoji ? tg.emoji + " " : "") + headlineText;
+
+  var age = document.createElement("div");
+  age.className = "age";
+  age.textContent = ago(m.time);
+  age.setAttribute("data-time", String(m.time)); // for the timestamp tick
+
+  row.appendChild(headline);
+  row.appendChild(age);
+  item.appendChild(row);
+
+  if (featured && bodyText) {
+    var body = document.createElement("div");
+    body.className = "body";
+    body.textContent = bodyText;
+    item.appendChild(body);
+  }
+  if (featured && tg.words) {
+    var tags = document.createElement("div");
+    tags.className = "tags";
+    tags.textContent = tg.words;
+    item.appendChild(tags);
+  }
+  return item;
+}
+
+// A half-clipped row reads as a rendering bug, so we drop whole items until the
+// list fits. This runs only on render (a new message, a uiSize change) — never
+// on a timer, and never in an animation frame.
+function trimToFit() {
+  var guard = RENDER_MAX;
+  while (guard-- > 0 &&
+         el.list.lastElementChild &&
+         el.list.children.length > 1 &&
+         el.list.scrollHeight > el.list.clientHeight) {
+    el.list.removeChild(el.list.lastElementChild);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 8. TIMESTAMP TICK
+ *
+ * The only recurring timer in the app. It rewrites a handful of text nodes, so
+ * it neither reflows the list nor touches the GPU, and it stops entirely when
+ * the page is hidden — a backgrounded widget in a car should cost nothing.
+ * ------------------------------------------------------------------------ */
+
+var tick = 0;
+function startTick() {
+  if (tick) return;
+  tick = setInterval(function () {
+    var ages = el.list.querySelectorAll(".age");
+    for (var i = 0; i < ages.length; i++) {
+      ages[i].textContent = ago(Number(ages[i].getAttribute("data-time")));
+    }
+  }, 30000);
+}
+function stopTick() { clearInterval(tick); tick = 0; }
+
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) {
+    stopTick();
+    return;
+  }
+  startTick();
+  render(); // catch up the timestamps immediately rather than up to 30s later
+
+  // Coming back from hidden is the one moment we cannot trust our own timers.
+  // The host hides the frame (rather than unmounting it) when the driver opens
+  // the nav drawer, and Chromium throttles timers in a hidden frame — so a
+  // watchdog or a backoff that was due five minutes ago may not have run. If
+  // the stream is not actually alive, restart it now; `since=<lastId>` fills in
+  // whatever arrived while we were away.
+  if (state.cfg && state.cfg.topic && !state.fatal &&
+      (!state.es || state.es.readyState === EventSource.CLOSED)) {
+    teardown();
+    connect();
+  }
+});
+
+// The host re-sends `context` when the slot resizes, but a slot can also be
+// resized by CSS on the host side without one. Observing our own box makes the
+// layout correct either way, and costs nothing when nothing moves — this is an
+// event, not a poll. It only re-lays-out; it never touches the subscription.
+if (typeof ResizeObserver === "function") {
+  new ResizeObserver(function () { scheduleRender(); }).observe(document.documentElement);
+}
+
+/* ---------------------------------------------------------------------------
+ * 9. BOOT
+ * ------------------------------------------------------------------------ */
+
+window.addEventListener("message", onHostMessage);
+startTick();
+postReady();
+</script>
+</body>
+</html>
